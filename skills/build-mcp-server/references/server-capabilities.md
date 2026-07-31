@@ -1,140 +1,231 @@
-# Server Capabilities
+# Server Capabilities and Cross-Cutting Features
 
-MCP has features beyond tools/resources/prompts. Add them only when the server
-needs them.
+Protocol revision `2026-07-28` makes server capabilities discoverable and
+client capabilities per-request. Add optional features only when the server's
+use case needs them, and never rely on a capability the peer did not declare.
 
-SDK APIs for these features are version-sensitive. Confirm the installed SDK
-before copying method names.
+SDK APIs are version-sensitive; confirm the installed version before copying
+method names.
 
----
+## Contents
+
+- Discovery, instructions, caching, and pagination
+- Subscriptions, progress, cancellation, and completion
+- Extensions and deprecated features
+- Capability checklist
+
+## `server/discover`
+
+Every modern server must implement `server/discover`. Its complete result
+advertises:
+
+- supported protocol versions
+- server capabilities
+- server identity in result `_meta`
+- optional instructions
+- `ttlMs` and `cacheScope`
+
+A modern SDK serving entry should install this automatically from the server
+factory. Test it directly; a working `tools/list` alone does not prove modern
+discovery or version negotiation.
+
+Capability and identity are not security claims. Authorize from verified HTTP
+credentials, not self-reported `clientInfo` or `serverInfo`.
 
 ## Instructions
 
-Server instructions describe cross-tool relationships, workflow patterns, or
-constraints. Hosts may include them in the model context.
-
-Use instructions for stable server-level guidance that does not belong in one
-tool description.
+Instructions describe stable cross-tool workflows and constraints:
 
 ```typescript
 const server = new McpServer(
   { name: "my-server", version: "1.0.0" },
-  { instructions: "Use search_items to discover IDs before calling get_item." },
+  {
+    instructions:
+      "Use search_items to discover IDs before get_item. Read current state before mutations.",
+  },
 );
 ```
 
-Some hosts use server instructions during startup and tool discovery. Keep the
-opening self-contained: what tasks this server handles, the normal discovery
-workflow, and important constraints such as rate limits or "read before write."
-Avoid burying critical guidance after a long preamble.
+Keep the opening self-contained: what the server does, its discovery-first
+workflow, and critical limits. Do not duplicate every tool description or try
+to override host/system behavior.
 
-Do not use instructions to override host/system behavior or duplicate every tool
-description.
+## Caching
 
----
+Modern complete results from these methods require `ttlMs` and `cacheScope`:
 
-## Sampling
+- `server/discover`
+- `tools/list`
+- `prompts/list`
+- `resources/list`
+- `resources/templates/list`
+- `resources/read`
 
-Sampling lets a server request model output from the connected host. Use it when
-tool logic needs summarization, classification, extraction, or generation but
-you do not want the MCP server to own an LLM provider integration.
+Use `ttlMs: 0` for immediately stale data. Use `cacheScope: "private"` for
+anything dependent on a user, tenant, token, or granted scope. `public` permits
+sharing across authorization contexts, even from an authenticated endpoint.
 
-Rules:
+TTL is a freshness hint checked when the result is needed, not a polling
+interval or a guarantee that data cannot change. Keep `cacheScope` identical
+across every page of the same paginated list.
 
-- check client capabilities before requesting sampling
-- provide a fallback if unsupported
-- do not send secrets or unnecessary private data
-- bound token/output size
+An input-required result is not cacheable. A request retry carrying
+`inputResponses` or `requestState` must not be cached.
 
----
+## Pagination
 
-## Roots
+List methods use opaque cursors. Do not parse them or assume a fixed page size;
+an empty string is still a valid cursor. Treat a missing `nextCursor` as the end.
+Each page has its own cache hints. If a cursor becomes invalid, discard the
+cached page chain and restart from the first page.
 
-Roots let a local-capable host tell a server which directories or workspace roots
-the user approved.
+## Subscriptions
 
-Use roots for local stdio servers that need filesystem boundaries. Do not
-hardcode broad filesystem access when roots are available.
+`subscriptions/listen` is the modern path for server-to-client change events.
+The client opens a long-lived request and explicitly selects:
 
-Roots are version-sensitive and may be deprecated in newer protocol versions, so
-prefer explicit configuration, tool parameters, or resource URIs when that is
-cleaner.
+- `toolsListChanged`
+- `promptsListChanged`
+- `resourcesListChanged`
+- `resourceSubscriptions` for named URIs
 
----
+The server's first message acknowledges the accepted filter. Every message on
+that stream carries `_meta.io.modelcontextprotocol/subscriptionId`, equal to the
+listen request ID. Never send a notification type the client did not request.
 
-## Logging
+On Streamable HTTP, the listen response is SSE and ends when the client closes
+it. On stdio, cancellation uses `notifications/cancelled`. Re-establish
+subscriptions after transport/process reconnect.
 
-MCP logging sends structured messages to the client. Prefer it over writing
-everything to stderr for remote servers.
+Make support an explicit serving decision. The official TypeScript v2
+`createMcpHandler` installs a listen router even when the application advertises
+no change capability. Capability advertising alone does not disable it:
 
-Use logging for:
+- without an application notification path, set `maxSubscriptions: 0` or
+  reject `subscriptions/listen` before SDK dispatch and assert it never opens
+  SSE
+- with support, provide a real event bus, bounded capacity, cancellation and
+  reconnect behavior, and event fan-out tests
+- for multi-process/isolate deployments, use a shared bus; the SDK's default
+  in-memory bus cannot fan out across instances
 
-- progress details that are useful to a user/developer
-- integration warnings
-- non-secret diagnostic context
-
-Do not log bearer tokens, upstream credentials, full private documents, or raw
-tool arguments that may contain secrets.
-
----
+This replaces the modern HTTP GET stream and
+`resources/subscribe`/`resources/unsubscribe`. Those older behaviors belong
+only to a legacy path.
 
 ## Progress
 
-Long-running tools can emit progress notifications when the client supplies a
-progress token.
+When the client includes a unique `progressToken` in request `_meta`, the server
+may send request-scoped `notifications/progress` before the final response.
 
-Rules:
+- progress must increase
+- total is optional
+- messages should be concise
+- stop notifications after completion/cancellation
+- rate limit updates
+- do not fail the operation merely because progress cannot be emitted
 
-- treat progress as optional
-- do not fail the tool if progress cannot be emitted
-- keep progress messages concise
-- still support cancellation
-
----
+On HTTP, progress stays on that request's SSE response stream. It is not a
+subscription event.
 
 ## Cancellation
 
-Long-running tools should honor the request cancellation signal provided by the
-SDK/runtime.
+Long-running handlers should propagate the SDK's abort signal into fetch,
+database, and child operations and check it inside long loops.
 
-For TypeScript handlers, pass the SDK `AbortSignal` to fetch/database clients
-when possible and check it in long loops.
+- Modern Streamable HTTP: closing the request's SSE response stream is
+  cancellation. Do not POST `notifications/cancelled` for that request.
+- Stdio: the client sends `notifications/cancelled` with the request ID.
 
-```typescript
-async (_args, ctx) => {
-  for (const item of items) {
-    if (ctx.signal?.aborted) {
-      throw new Error("Cancelled");
-    }
-    await process(item);
-  }
-}
-```
-
-The exact signal location differs by SDK version. Check the installed SDK docs.
-
----
+Stop work, free resources, and send no later response when cancellation wins.
+Handle completion/cancellation races without treating them as server faults.
 
 ## Completion
 
-Completion provides autocomplete suggestions for prompt arguments or resource
-template variables.
+Completion offers suggestions for prompt arguments and resource template
+variables through `completion/complete`.
 
-Use it when users must choose from many valid values, such as table names,
-workspace IDs, projects, labels, or document paths.
+Use it when users choose among many workspace IDs, project names, labels,
+tables, or document paths. Suggestions should be relevance-sorted,
+access-controlled, rate-limited, and capped. Skip it when discovery is already
+easy.
 
-Skip it for the first version unless argument discovery is painful.
+## Extensions
 
----
+Optional extensions are negotiated in the `extensions` maps of client and
+server capabilities. Extension identifiers require a vendor-style prefix and
+each extension defines its own settings object.
+
+If the peer does not advertise an extension, fall back to core behavior or
+return an appropriate error as the extension specifies. Do not put extension
+messages on the core path without negotiation.
+
+Tasks are no longer a core protocol feature. Modern task support uses the
+official `io.modelcontextprotocol/tasks` extension. It adds
+`resultType: "task"`, durable handles, polling through `tasks/get`, mid-flight
+input through `tasks/update`, cooperative `tasks/cancel`, and optional task
+notifications through `subscriptions/listen`. It removes the old blocking
+`tasks/result` and `tasks/list` methods. Do not return a task unless the client
+declared the extension, and provide a synchronous/core fallback when practical.
+
+Extensions evolve independently of core MCP. Verify the installed SDK and the
+extension's own version/settings rather than inferring support from core
+`2026-07-28` conformance.
+
+## Deprecated features
+
+The following remain in `2026-07-28` during their deprecation windows but new
+servers should not adopt them.
+
+Roots, Sampling, Logging, and DCR first become eligible for removal in a
+revision released on or after `2027-07-28`; eligibility is not a guaranteed
+removal date. HTTP+SSE follows the separate date in the live deprecated-features
+registry.
+
+### Roots
+
+Migration: pass directories/files through tool arguments, resource URIs, or
+server configuration. Roots were only guidance, never an enforced filesystem
+sandbox. Validate and authorize paths independently.
+
+### Sampling
+
+Migration: integrate directly with an LLM provider from the server when the
+feature is truly needed. Do not assume the connected host will run model work
+for a new server. The `includeContext` values `"thisServer"` and `"allServers"`
+are also deprecated; omit the field or use `"none"` while maintaining this
+surface.
+
+### MCP Logging
+
+Migration: log to stderr for stdio and use OpenTelemetry for structured remote
+observability. Never write non-MCP data to stdout. In the deprecated modern
+logging surface, log level is per request in
+`_meta.io.modelcontextprotocol/logLevel`; `logging/setLevel` is gone and the
+server must not emit `notifications/message` when the field is absent.
+
+### DCR and HTTP+SSE
+
+Dynamic Client Registration is deprecated in favor of Client ID Metadata
+Documents, though tested host compatibility may require a fallback. HTTP+SSE is
+deprecated in favor of Streamable HTTP.
+
+### Removed core methods
+
+Do not implement modern health or lifecycle logic with `ping`,
+`logging/setLevel`, or `notifications/roots/list_changed`; they were removed
+from the core revision. Use a transport/application health endpoint,
+per-request `logLevel` only for deprecated MCP logging, and explicit
+application configuration/invalidation instead.
 
 ## Capability checklist
 
-| Feature | Needs client capability? | Safe fallback |
-|---|---|---|
-| instructions | no explicit client capability | omit if not useful |
-| logging | server capability + client support varies | server logs |
-| progress | client sends a progress token | silently skip progress |
-| sampling | yes | return a tool error or use server-owned LLM if explicitly chosen |
-| elicitation | yes | return a tool error or ask for input as a normal argument |
-| roots | yes | explicit config/tool parameter |
-| completion | yes | no autocomplete |
+| Feature                 | Declaration/opt-in                                                                      | Default fallback                                         |
+| ----------------------- | --------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| tools/resources/prompts | Server advertises in `server/discover`                                                  | method unavailable                                       |
+| list/resource changes   | Client opens `subscriptions/listen` with exact filter and server explicitly supports it | TTL refresh or explicit listen rejection                 |
+| progress                | Client provides `progressToken`                                                         | complete silently                                        |
+| elicitation             | Client declares form and/or URL per request                                             | return useful failure or require ordinary argument/setup |
+| completion              | Server advertises completions                                                           | no suggestions                                           |
+| extensions              | Both peers advertise the identifier                                                     | core behavior or documented error                        |
+| roots/sampling/logging  | Deprecated capability plus MRTR/request opt-in as applicable                            | use migration path                                       |

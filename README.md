@@ -1,8 +1,14 @@
 # build-mcp-server
 
-A portable Agent Skill for designing and building Model Context Protocol servers.
-The skill guides agents through use-case discovery, deployment-model selection,
-tool/resource/prompt design, auth choices, scaffolding, testing, and deployment.
+A portable Agent Skill for designing, building, auditing, and migrating Model
+Context Protocol servers. The skill guides agents through use-case discovery,
+deployment-model selection, tool/resource/prompt design, auth choices,
+scaffolding, testing, and deployment.
+
+The current guidance targets the released MCP `2026-07-28` stateless protocol
+and keeps compatibility with the initialization-based 2025 era explicit. Its
+default TypeScript scaffold uses the official v2 split packages, and its
+migration playbook covers modern-only and dual-era upgrades.
 
 This repo contains one skill: `build-mcp-server`.
 
@@ -30,5 +36,10 @@ npx skills add /Users/ramos/oss/build-mcp-server
 skills/build-mcp-server/
 ├── SKILL.md
 ├── agents/openai.yaml
+├── assets/typescript-http/       # pinned, compile-tested modern HTTP example
 └── references/
+    ├── protocol-eras.md
+    ├── migrate-2026-07-28.md
+    ├── remote-http-scaffold.md
+    └── ...
 ```

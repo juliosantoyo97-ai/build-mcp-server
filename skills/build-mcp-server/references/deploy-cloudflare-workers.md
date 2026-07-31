@@ -1,107 +1,184 @@
-# Deploy to Cloudflare Workers
+# Deploy a Modern MCP Server to Cloudflare Workers
 
-Fastest path from zero to a live `https://` MCP URL. Free tier, no credit card to start, two commands to deploy.
+Use the official TypeScript SDK v2 web-standard handler for a
+`2026-07-28`-era Worker. A Cloudflare `McpAgent`/Durable Object template that
+implements protocol sessions may still be useful for 2025-era compatibility,
+but it must not be presented as the current stateless transport without
+explicit modern-protocol support.
 
-**Trade-off:** This is a Workers-native scaffold, not a deploy target for the Express scaffold in `remote-http-scaffold.md`. Different runtime. If you need portability across hosts, stick with Express. If you just want it live, start here.
+## Contents
 
----
+- Bootstrap and Worker entry
+- Listen and application state
+- Host/Origin policy
+- Authorization
+- Compatibility gate
 
 ## Bootstrap
 
+Create a TypeScript Worker, then install a matched v2 SDK line and Zod:
+
 ```bash
-npm create cloudflare@latest -- my-mcp-server \
-  --template=cloudflare/ai/demos/remote-mcp-authless
+npm create cloudflare@latest -- my-mcp-server
 cd my-mcp-server
+npm install @modelcontextprotocol/server zod
 ```
 
-This pulls a minimal template with the right deps (`agents`, `zod`) and a working `wrangler.jsonc`.
-
----
+Check `@modelcontextprotocol/server` package tags first. This reference targets
+the stable v2 line.
 
 ## `src/index.ts`
 
-Replace the template's calculator example with your tools. Use `registerTool()` (same API as the Express scaffold — the `McpServer` instance is identical):
-
 ```typescript
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { McpAgent } from "agents/mcp";
-import { z } from "zod";
+import {
+  createMcpHandler,
+  hostHeaderValidationResponse,
+  McpServer,
+  originValidationResponse,
+} from "@modelcontextprotocol/server";
+import * as z from "zod/v4";
 
-export class MyMCP extends McpAgent {
-  server = new McpServer(
-    { name: "my-service", version: "0.1.0" },
-    { instructions: "Prefer search_items before get_item — IDs aren't guessable." },
-  );
-
-  async init() {
-    this.server.registerTool(
-      "search_items",
-      {
-        description: "Search items by keyword. Returns up to `limit` matches.",
-        inputSchema: {
-          query: z.string().describe("Search keywords"),
-          limit: z.number().int().min(1).max(50).default(10),
-        },
-        annotations: { readOnlyHint: true },
-      },
-      async ({ query, limit }) => {
-        const results = await upstreamApi.search(query, limit);
-        return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
-      },
-    );
-  }
+interface Env {
+  ALLOWED_HOSTS: string;
+  ALLOWED_ORIGIN_HOSTS: string;
 }
 
+const ITEMS = [
+  { id: "item_001", title: "First item" },
+  { id: "item_002", title: "Second item" },
+];
+
+function csv(value: string): string[] {
+  return value
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function buildServer() {
+  const server = new McpServer(
+    { name: "my-service", version: "0.1.0" },
+    {
+      instructions:
+        "Use search_items to discover IDs before requesting details.",
+      cacheHints: {
+        "tools/list": { ttlMs: 60_000, cacheScope: "public" },
+      },
+    },
+  );
+
+  server.registerTool(
+    "search_items",
+    {
+      title: "Search items",
+      description:
+        "Search items by keyword and return IDs for follow-up calls.",
+      inputSchema: z.object({
+        query: z.string().min(1).describe("Keywords to search for"),
+        limit: z.number().int().min(1).max(50).default(10),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ query, limit }) => {
+      const needle = query.toLowerCase();
+      const results = ITEMS.filter((item) =>
+        item.title.toLowerCase().includes(needle),
+      ).slice(0, limit);
+      return {
+        content: [{ type: "text", text: JSON.stringify({ results }) }],
+        structuredContent: { results },
+      };
+    },
+  );
+
+  return server;
+}
+
+const handler = createMcpHandler(buildServer, {
+  legacy: "reject",
+  maxSubscriptions: 0,
+});
+
 export default {
-  fetch(request: Request, env: Env, ctx: ExecutionContext) {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === "/mcp") {
-      return MyMCP.serve("/mcp").fetch(request, env, ctx);
+    if (url.pathname !== "/mcp") {
+      return new Response("Not found", { status: 404 });
     }
-    return new Response("Not found", { status: 404 });
+
+    const rejected =
+      hostHeaderValidationResponse(request, csv(env.ALLOWED_HOSTS)) ??
+      originValidationResponse(request, csv(env.ALLOWED_ORIGIN_HOSTS));
+    if (rejected) return rejected;
+
+    return handler.fetch(request);
   },
 };
 ```
 
-`McpAgent` is Cloudflare's wrapper — it handles the streamable-HTTP transport, session routing, and Durable Object plumbing. Your code only touches `this.server`, which is the same `McpServer` class from the SDK. Everything in `tool-design.md` and `server-capabilities.md` applies unchanged.
+`createMcpHandler` creates a fresh server per request. No Durable Object,
+protocol session, session routing, GET stream, DELETE endpoint, or SSE replay is
+needed for the modern core protocol. Use Durable Objects only for actual
+application state or multi-instance notification fan-out, with explicit state
+handles and authorization—not to recreate `Mcp-Session-Id`.
 
----
+This minimal Worker explicitly rejects `subscriptions/listen` by setting
+`maxSubscriptions: 0`; it must not open SSE when the application has no event
+source. To enable listen, supply a real `ServerEventBus`, a positive bounded
+capacity, cancellation/reconnect tests, and cross-isolate fan-out. An in-memory
+bus is insufficient across Worker isolates; a Durable Object or another shared
+event backbone can own that application concern.
 
-## `wrangler.jsonc`
+## Configure and deploy
 
-The template ships this. The Durable Objects block is **boilerplate** — `McpAgent` uses DO for session state. You don't interact with it directly.
-
-```jsonc
-{
-  "name": "my-mcp-server",
-  "main": "src/index.ts",
-  "compatibility_date": "2025-03-10",
-  "compatibility_flags": ["nodejs_compat"],
-  "migrations": [{ "new_sqlite_classes": ["MyMCP"], "tag": "v1" }],
-  "durable_objects": {
-    "bindings": [{ "class_name": "MyMCP", "name": "MCP_OBJECT" }]
-  }
-}
-```
-
-If you rename the `MyMCP` class, update both `new_sqlite_classes` and `class_name` to match.
-
----
-
-## Run and deploy
+Set `ALLOWED_HOSTS` to the deployed Worker hostname. The SDK
+`originValidationResponse` helper is a hostname allowlist and ignores scheme and
+port, so `ALLOWED_ORIGIN_HOSTS` intentionally contains bare hostnames. Include
+the local hostname in a development environment only when needed. If policy
+must distinguish HTTPS from HTTP or production from a development port,
+validate the complete serialized `Origin` value before calling the hostname
+helper.
 
 ```bash
-npx wrangler dev     # → http://localhost:8787/mcp
-npx wrangler deploy  # → https://my-mcp-server.<account>.workers.dev/mcp
+npx wrangler dev
+npx wrangler deploy
 ```
 
-`wrangler deploy` prints the live URL. That's the URL MCP clients/hosts use for
-the remote server.
+Store upstream secrets with Worker secrets, not `vars` committed to source:
 
-Secrets (upstream API keys): `npx wrangler secret put UPSTREAM_API_KEY`, then read `env.UPSTREAM_API_KEY` inside `init()`.
+```bash
+npx wrangler secret put UPSTREAM_API_KEY
+```
 
----
+## Authorization
 
-## OAuth
+For a protected server, verify the bearer token before `handler.fetch` and pass
+the resulting `authInfo` into the handler. Also serve OAuth Protected Resource
+Metadata at the path-aware RFC 9728 location and return a useful
+`WWW-Authenticate` challenge.
 
-Cloudflare ships `@cloudflare/workers-oauth-provider` — a drop-in that handles the authorization server side (CIMD/DCR endpoints, token issuance, consent UI). It wraps your `McpAgent` and gates `/mcp` behind a token check. See `auth.md` for the protocol details; the CF template `cloudflare/ai/demos/remote-mcp-github-oauth` shows the wiring.
+An authorization-server library can issue tokens, but it does not replace the
+MCP resource-server checks: validate expiry, issuer, audience/resource, scopes,
+and caller/tenant binding. Client ID Metadata Documents are the preferred open
+registration path in `2026-07-28`; Dynamic Client Registration is deprecated
+and should exist only as a tested compatibility fallback.
+
+## Compatibility gate for Cloudflare-specific wrappers
+
+Before substituting `McpAgent` or another wrapper, verify that its installed
+version supports:
+
+- `server/discover` and the per-request metadata envelope
+- POST-only modern Streamable HTTP and required MCP headers
+- required `resultType`, `ttlMs`, and `cacheScope` fields
+- MRTR `input_required` instead of direct server-to-client JSON-RPC requests
+- an explicit `subscriptions/listen` behavior: tested rejection, or a real
+  shared event bus with capacity and cancellation
+- no modern dependency on session IDs, GET/DELETE, or `Last-Event-ID`
+
+If it does not, keep the web-standard handler above or label the wrapper route
+as a separate legacy endpoint.

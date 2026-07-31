@@ -1,7 +1,7 @@
 interface:
-  display_name: "Build MCP Server"
-  short_description: "Design and scaffold MCP servers"
-  default_prompt: "Use $build-mcp-server to design and build an MCP server."
+  display_name: "Build, Audit, and Migrate MCP Servers"
+  short_description: "Build, review, and upgrade MCP servers"
+  default_prompt: "Use $build-mcp-server to build, audit, migrate, or upgrade an MCP server against its target protocol revision."
 
 policy:
   allow_implicit_invocation: true

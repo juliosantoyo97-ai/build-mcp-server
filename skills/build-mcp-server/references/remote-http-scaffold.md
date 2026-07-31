@@ -1,70 +1,146 @@
-# Remote Streamable HTTP MCP Server — Scaffold
+# Modern Remote Streamable HTTP Scaffold (TypeScript)
 
-This reference gives small remote MCP server scaffolds. Start with one read-only
-tool, verify the transport, then add real tools/resources.
+This scaffold targets protocol revision `2026-07-28` with the official
+TypeScript SDK v2 split packages. It is intentionally not a v1
+`StreamableHTTPServerTransport` example: that API serves the 2025-era protocol.
 
-## Version boundary
+Read `protocol-eras.md` first. Before copying imports, confirm that the selected
+package versions expose `createMcpHandler` and advertise `2026-07-28` support.
 
-The TypeScript scaffold below targets the stable v1 SDK package:
+## Contents
+
+- Install and ESM project configuration
+- Server and serving entry
+- Listen and legacy compatibility choices
+- Authorization
+- Handler, outer-composition, and raw-wire tests
+- Stdio and other SDKs
+
+## Install
+
+Inspect package tags, then install one internally consistent v2 line:
 
 ```bash
-npm install @modelcontextprotocol/sdk zod express
-```
+npm view @modelcontextprotocol/server dist-tags
+npm view @modelcontextprotocol/node dist-tags
+npm view @modelcontextprotocol/express dist-tags
 
-The SDK v2 development branch uses split packages such as
-`@modelcontextprotocol/server`, `@modelcontextprotocol/node`, and
-`@modelcontextprotocol/express`. If the target repo already uses v2/split
-packages, adapt the imports and transport class before coding. Do not mix v1 and
-v2 examples.
-
----
-
-## TypeScript SDK + Express
-
-```bash
-npm init -y
-npm install @modelcontextprotocol/sdk zod express
+npm install @modelcontextprotocol/server \
+  @modelcontextprotocol/node \
+  @modelcontextprotocol/express \
+  express zod
 npm install -D typescript @types/express @types/node tsx
 ```
 
-**`src/server.ts`**
+The split packages were stable at `2.0.0` when this reference was checked. Do
+not combine `@modelcontextprotocol/sdk` v1 imports with the v2 scaffold.
+
+For a copyable project with exact dependency versions plus compile and smoke
+scripts, start from `../assets/typescript-http/`. Keep those pins until an
+upgrade is separately verified.
+
+Use ESM explicitly. `npm init -y` alone creates a CommonJS package, which does
+not run the top-level-await client smoke test below.
+
+Minimal `package.json` fields:
+
+```json
+{
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "start": "tsx src/server.ts"
+  }
+}
+```
+
+Minimal `tsconfig.json`:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"]
+}
+```
+
+## `src/server.ts`
 
 ```typescript
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import express, { type NextFunction, type Request, type Response } from "express";
-import { z } from "zod";
+import { createMcpExpressApp } from "@modelcontextprotocol/express";
+import { toNodeHandler } from "@modelcontextprotocol/node";
+import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
+import * as z from "zod/v4";
 
 const ITEMS = [
-  { id: "item_001", title: "First item", body: "Example item for local smoke tests." },
+  {
+    id: "item_001",
+    title: "First item",
+    body: "Example item for smoke tests.",
+  },
   { id: "item_002", title: "Second item", body: "Another example item." },
 ];
 
-function createServer() {
+function buildServer() {
   const server = new McpServer(
     { name: "my-service", version: "0.1.0" },
-    { instructions: "Use search_items to discover IDs before calling get_item." },
+    {
+      instructions: "Use search_items to discover IDs before calling get_item.",
+      cacheHints: {
+        "tools/list": { ttlMs: 60_000, cacheScope: "public" },
+      },
+    },
   );
 
   server.registerTool(
     "search_items",
     {
       title: "Search items",
-      description: "Search items by keyword. Returns up to limit matches with IDs for follow-up calls.",
-      inputSchema: {
-        query: z.string().min(1).describe("Search keywords"),
-        limit: z.number().int().min(1).max(50).default(10).describe("Maximum number of matches"),
+      description:
+        "Search item titles and bodies by keyword. Returns up to limit matches with IDs for get_item.",
+      inputSchema: z.object({
+        query: z
+          .string()
+          .min(1)
+          .describe("Keywords to match in item titles and bodies"),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(50)
+          .default(10)
+          .describe("Maximum matches; defaults to 10 and cannot exceed 50"),
+      }),
+      outputSchema: z.object({
+        results: z.array(
+          z.object({ id: z.string(), title: z.string(), body: z.string() }),
+        ),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: false,
       },
-      annotations: { readOnlyHint: true, destructiveHint: false },
     },
     async ({ query, limit }) => {
-      const q = query.toLowerCase();
+      const needle = query.toLowerCase();
       const results = ITEMS.filter(
-        (item) => item.title.toLowerCase().includes(q) || item.body.toLowerCase().includes(q),
+        (item) =>
+          item.title.toLowerCase().includes(needle) ||
+          item.body.toLowerCase().includes(needle),
       ).slice(0, limit);
 
+      const output = { results };
       return {
-        content: [{ type: "text", text: JSON.stringify({ results }, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(output) }],
+        structuredContent: output,
       };
     },
   );
@@ -73,20 +149,42 @@ function createServer() {
     "get_item",
     {
       title: "Get item",
-      description: "Fetch one item by ID. Use search_items first if you do not know the ID.",
-      inputSchema: { id: z.string().regex(/^item_[0-9]{3}$/).describe("Item ID, such as item_001") },
-      annotations: { readOnlyHint: true, destructiveHint: false },
+      description:
+        "Fetch one item by ID. Use search_items first when the ID is unknown.",
+      inputSchema: z.object({
+        id: z
+          .string()
+          .regex(/^item_[0-9]{3}$/)
+          .describe("Item ID returned by search_items, such as item_001"),
+      }),
+      outputSchema: z.object({
+        id: z.string(),
+        title: z.string(),
+        body: z.string(),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: false,
+      },
     },
     async ({ id }) => {
       const item = ITEMS.find((candidate) => candidate.id === id);
       if (!item) {
         return {
           isError: true,
-          content: [{ type: "text", text: `Item ${id} was not found. Use search_items to find valid IDs.` }],
+          content: [
+            {
+              type: "text",
+              text: `Item ${id} was not found. Use search_items to find valid IDs.`,
+            },
+          ],
         };
       }
+
       return {
-        content: [{ type: "text", text: JSON.stringify(item, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(item) }],
+        structuredContent: item,
       };
     },
   );
@@ -94,259 +192,185 @@ function createServer() {
   return server;
 }
 
-function parseCsv(value: string | undefined): Set<string> {
-  return new Set((value ?? "").split(",").map((part) => part.trim()).filter(Boolean));
-}
-
-const allowedOrigins = parseCsv(process.env.ALLOWED_ORIGINS);
-
-function validateOrigin(req: Request, res: Response, next: NextFunction) {
-  const origin = req.header("origin");
-  // Origin is often absent for non-browser MCP clients. If it is present, enforce
-  // the allow-list. Production browser-accessible deployments must set ALLOWED_ORIGINS.
-  if (origin && allowedOrigins.size === 0 && process.env.NODE_ENV === "production") {
-    res.status(403).json({
-      jsonrpc: "2.0",
-      error: { code: -32000, message: "Origin allow-list is not configured" },
-      id: null,
-    });
-    return;
-  }
-  if (origin && allowedOrigins.size > 0 && !allowedOrigins.has(origin)) {
-    res.status(403).json({
-      jsonrpc: "2.0",
-      error: { code: -32000, message: "Invalid Origin header" },
-      id: null,
-    });
-    return;
-  }
-  next();
-}
-
-function requireBearerToken(req: Request, res: Response, next: NextFunction) {
-  const expected = process.env.MCP_BEARER_TOKEN;
-  if (!expected) {
-    next(); // authless local/dev mode only; require auth before exposing private data
-    return;
-  }
-  const auth = req.header("authorization") ?? "";
-  if (auth !== `Bearer ${expected}`) {
-    res.status(401).json({
-      jsonrpc: "2.0",
-      error: { code: -32001, message: "Unauthorized" },
-      id: null,
-    });
-    return;
-  }
-  next();
-}
-
-const app = express();
-app.use(express.json({ limit: "1mb" }));
-app.use(validateOrigin);
-app.use(requireBearerToken);
-
-app.post("/mcp", async (req, res) => {
-  const server = createServer();
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined, // stateless; no resumability
-  });
-
-  res.on("close", () => {
-    transport.close();
-  });
-
-  try {
-    await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
-  } catch (error) {
-    console.error("MCP request failed", error);
-    if (!res.headersSent) {
-      res.status(500).json({
-        jsonrpc: "2.0",
-        error: { code: -32603, message: "Internal server error" },
-        id: null,
-      });
-    }
-  }
+// The handler creates a fresh McpServer for every HTTP request. This primary
+// scaffold is modern-only and deliberately refuses subscriptions/listen rather
+// than opening a long-lived SSE response with no application notification path.
+const handler = createMcpHandler(buildServer, {
+  legacy: "reject",
+  maxSubscriptions: 0,
 });
 
-// Stateless servers do not open a long-lived SSE stream. Handle the method
-// explicitly so clients get an MCP-shaped response rather than an HTML 404.
-app.get("/mcp", (_req, res) => {
-  res.status(405).json({
-    jsonrpc: "2.0",
-    error: { code: -32000, message: "GET is not supported by this stateless MCP server" },
-    id: null,
-  });
-});
+// This factory installs JSON parsing plus localhost Host and Origin guards.
+const app = createMcpExpressApp();
+const nodeHandler = toNodeHandler(handler);
 
-app.delete("/mcp", (_req, res) => {
-  res.status(405).json({
-    jsonrpc: "2.0",
-    error: { code: -32000, message: "DELETE is not supported by this stateless MCP server" },
-    id: null,
-  });
+app.all("/mcp", (req, res) => {
+  void nodeHandler(req, res, req.body);
 });
 
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
-app.listen(Number(process.env.PORT ?? 3000), () => {
-  console.log("MCP server listening on http://localhost:3000/mcp");
+const port = Number(process.env.PORT ?? 3000);
+app.listen(port, "127.0.0.1", () => {
+  console.error(`MCP server listening on http://127.0.0.1:${port}/mcp`);
 });
 ```
 
-**Stateless vs stateful:** this creates a fresh transport per request and sets
-`sessionIdGenerator: undefined`. That is fine for most API-wrapping servers. If
-you need resumability, server-initiated streams, or shared per-session state, use
-the SDK's stateful Streamable HTTP example and implement `GET /mcp` and
-`DELETE /mcp` for stream/resume/session termination.
+For a public bind, configure `allowedHosts` and `allowedOrigins` on the framework
+factory. A request without `Origin` normally comes from a non-browser client and
+may pass; a present Origin must be checked. Do not expose a private-data or
+mutating server before adding authorization.
 
-**Auth:** `MCP_BEARER_TOKEN` is only a simple private-server example. Real
-multi-user products should validate a user/team/workspace-scoped token or
-OAuth-issued access token before dispatching MCP requests.
+### Enabling `subscriptions/listen`
 
----
+`createMcpHandler` installs a listen router independently of advertised
+application capabilities. Omitting a subscription capability does not disable
+that router. Keep `maxSubscriptions: 0` when the server has no notification
+path, and test that a listen request returns an in-band error without opening
+SSE.
 
-## FastMCP 3.x (Python)
+To support listen, replace that rejection with a real `ServerEventBus`, set a
+bounded positive subscription limit and keepalive policy, publish application
+events to the bus, propagate cancellation, and test fan-out and reconnect. The
+default in-memory bus reaches only one process or isolate; a multi-instance
+deployment needs a shared bus.
 
-```bash
-pip install fastmcp
-```
+### Deliberate dual-era variant
 
-**`server.py`**
-
-```python
-from fastmcp import FastMCP
-
-mcp = FastMCP(
-    name="my-service",
-    instructions="Use search_items to discover IDs before calling get_item.",
-)
-
-ITEMS = [
-    {"id": "item_001", "title": "First item", "body": "Example item for smoke tests."},
-    {"id": "item_002", "title": "Second item", "body": "Another example item."},
-]
-
-@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
-def search_items(query: str, limit: int = 10) -> dict:
-    """Search items by keyword. Returns matches with IDs for follow-up calls."""
-    q = query.lower()
-    results = [
-        item for item in ITEMS
-        if q in item["title"].lower() or q in item["body"].lower()
-    ][:limit]
-    return {"results": results}
-
-@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
-def get_item(id: str) -> dict:
-    """Fetch one item by ID. Use search_items first if you do not know the ID."""
-    for item in ITEMS:
-        if item["id"] == id:
-            return item
-    raise ValueError(f"Item {id} was not found")
-
-if __name__ == "__main__":
-    mcp.run(transport="http", host="127.0.0.1", port=3000)
-```
-
-FastMCP derives JSON schema from type hints. Keep docstrings terse and
-action-oriented; they are visible to models and hosts.
-
----
-
-## Search + execute pattern
-
-When wrapping dozens or hundreds of operations, do not register every endpoint as
-a tool. Use a catalog internally and expose discovery plus execution:
+Only enable legacy serving for a required, tested client:
 
 ```typescript
-const CATALOG = loadActionCatalog(); // { id, description, paramSchema }[]
+const handler = createMcpHandler(buildServer, {
+  maxSubscriptions: 0,
+  // Omitting legacy: "reject" enables the SDK's stateless legacy path.
+});
+```
 
-server.registerTool(
-  "search_actions",
+Keep sessionful legacy HTTP behind a separate legacy handler. Do not add
+session state to the modern factory.
+
+## What the serving entry owns
+
+On the modern path, application code should not manually add wire bookkeeping.
+A conforming SDK serving entry owns:
+
+- `server/discover`
+- per-request protocol version, identity, and capability envelopes
+- required `resultType` on results
+- required `ttlMs`/`cacheScope` defaults on cacheable results
+- `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, and `Mcp-Param-*`
+  validation for JSON-RPC request POSTs
+- JSON versus request-scoped SSE response handling
+- modern transport cancellation behavior
+- `subscriptions/listen` routing, which the application must explicitly reject
+  or back with a real event bus
+
+The application owns tool/resource/prompt definitions, access control,
+authorization, upstream calls, domain errors, application state, and any MRTR
+state codec.
+
+## Add authorization
+
+When OAuth protects the server, the MCP server is the protected resource, not
+necessarily the authorization server. Verify the bearer token before the MCP
+handler and pass the verified principal as the SDK's `authInfo`. Publish
+path-aware OAuth Protected Resource Metadata and a useful `WWW-Authenticate`
+challenge.
+
+Do not treat the simple comparison of an environment token as a production
+multi-user OAuth implementation. See `auth.md`.
+
+## Test the actual modern path
+
+Use the official v2 client in-process for a fast handler-level test:
+
+```typescript
+import assert from "node:assert/strict";
+import {
+  Client,
+  StreamableHTTPClientTransport,
+} from "@modelcontextprotocol/client";
+
+const transport = new StreamableHTTPClientTransport(
+  new URL("http://test.local/mcp"),
   {
-    title: "Search actions",
-    description: "Find available actions matching an intent. Returns action IDs, descriptions, and parameter schemas.",
-    inputSchema: { intent: z.string().describe("What you want to do, in plain English") },
-    annotations: { readOnlyHint: true, destructiveHint: false },
-  },
-  async ({ intent }) => {
-    const matches = rankActions(CATALOG, intent).slice(0, 10);
-    return { content: [{ type: "text", text: JSON.stringify({ matches }, null, 2) }] };
+    fetch: (url, init) => handler.fetch(new Request(url, init)),
   },
 );
 
-server.registerTool(
-  "execute_action",
-  {
-    title: "Execute action",
-    description: "Execute an action by ID. Get the ID and params schema from search_actions first.",
-    inputSchema: {
-      action_id: z.string(),
-      params: z.record(z.unknown()),
-    },
-    annotations: { readOnlyHint: false, destructiveHint: true },
-  },
-  async ({ action_id, params }) => {
-    const action = CATALOG.find((candidate) => candidate.id === action_id);
-    if (!action) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: `Unknown action ${action_id}. Call search_actions first.` }],
-      };
-    }
-    const parsed = parseParams(params, action.paramSchema);
-    const result = await dispatch(action, parsed);
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-  },
+const client = new Client(
+  { name: "test-client", version: "1.0.0" },
+  { versionNegotiation: { mode: { pin: "2026-07-28" } } },
 );
+
+await client.connect(transport);
+const tools = await client.listTools();
+assert.deepEqual(
+  tools.tools.map((tool) => tool.name),
+  ["search_items", "get_item"],
+);
+
+const result = await client.callTool({
+  name: "search_items",
+  arguments: { query: "item" },
+});
+assert.equal(result.isError, undefined);
+
+await client.close();
+await handler.close();
 ```
 
-Start with keyword matching for `rankActions`. Upgrade to embeddings only if the
-catalog is large enough to need it.
+This test intentionally calls `handler.fetch` directly. It proves the MCP
+handler path, but bypasses the deployed Express Host, Origin, and authorization
+composition. Also start the actual app on an ephemeral loopback port and send
+HTTP requests through that socket. At minimum assert:
 
----
+- allowed and rejected Host/Origin values
+- unauthenticated and authorized access when auth is enabled
+- malformed JSON and unexpected content types never become HTML responses
+- the `/mcp` method/status behavior and the separate health endpoint
+- proxy/header normalization exactly as deployed
 
-## Test it
+Send a raw pinned-modern `subscriptions/listen` request as well. With this
+minimal scaffold it must complete with a JSON-RPC error and `Content-Type` must
+not be `text/event-stream`. If listen is enabled, invert the assertion and test
+stream cancellation, capacity, fan-out, and reconnect.
 
-Use MCP Inspector for local interactive and scripted checks.
+Also run wire/conformance tests for missing `_meta`, unsupported version,
+missing or mismatched request-POST MCP headers, malformed input, and cache
+scope. Test every server response mode you enable. A JSON-only server is valid;
+MCP clients must accept both JSON and request-scoped SSE. High-level SDK APIs may
+consume wire-only fields such as `resultType`, so conformance checks are still
+needed.
 
-```bash
-# Interactive UI
-npx @modelcontextprotocol/inspector
-# Select Streamable HTTP, paste http://localhost:3000/mcp, connect.
+For a mutation, also abort the response after the handler commits and retry with
+a new JSON-RPC ID. Verify application-level idempotency or recovery; modern SSE
+responses are not resumable and a lost result does not prove the mutation was
+rolled back.
+
+Use a current MCP Inspector build that explicitly supports the target revision.
+An Inspector connection that silently falls back to a 2025-era handshake does
+not prove modern conformance.
+
+## Stdio equivalent
+
+Use the same `buildServer` factory with the v2 stdio serving entry:
+
+```typescript
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
+
+serveStdio(buildServer);
+console.error("MCP server listening on stdio");
 ```
 
-Scripted checks:
+Never write logs to stdout. The modern stdio process is still stateless at the
+protocol layer and may interleave unrelated requests.
 
-```bash
-npx @modelcontextprotocol/inspector --cli http://localhost:3000/mcp \
-  --transport http --method tools/list
+## Other SDKs
 
-npx @modelcontextprotocol/inspector --cli http://localhost:3000/mcp \
-  --transport http --method tools/call --tool-name search_items --tool-arg query=item
-```
-
-If auth is enabled, configure the target host or Inspector with the expected
-`Authorization` header.
-
----
-
-## Deploy
-
-The Express scaffold runs on any ordinary Node host: Render, Railway, Fly.io,
-Kubernetes, a VPS, or a container platform.
-
-Deployment basics:
-
-- set `MCP_BEARER_TOKEN` or real auth before exposing private data
-- set `ALLOWED_ORIGINS` for browser-accessible deployments
-- serve over HTTPS
-- add a separate `/healthz`
-- log request failures without logging tokens or tool arguments that may contain
-  secrets
-
-For Cloudflare Workers, use `deploy-cloudflare-workers.md`; the runtime and
-transport wiring are different from this Express scaffold.
+Before using FastMCP or another framework for a modern server, verify all of the
+following in the installed version: no initialization dependency, per-request
+metadata, `server/discover`, `resultType`, cache hints, MRTR,
+`subscriptions/listen`, modern HTTP headers, and no session/GET/resumability
+assumptions. If any are absent, either choose a supporting SDK or label the
+server as targeting the older protocol revision.

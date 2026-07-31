@@ -1,263 +1,357 @@
 ---
 name: build-mcp-server
-description: Design and scaffold Model Context Protocol servers. Use when the user asks to build an MCP server, create an MCP integration, expose an API or data source through MCP tools/resources/prompts, or choose an MCP transport/auth/deployment shape.
-metadata:
-  version: "0.2.1"
+description: Design, scaffold, audit, and upgrade Model Context Protocol servers. Use when the user asks to build or migrate an MCP server, adopt MCP 2026-07-28, add dual-era support, create an MCP integration, expose an API or data source through MCP tools/resources/prompts, or choose an MCP transport/auth/deployment shape.
 ---
 
 # Build an MCP Server
 
-You are helping design and build an MCP server. Keep the work focused on the
-server: protocol primitives, transport, auth, validation, tests, and deployment.
+Help design and build MCP servers. Keep the work focused on protocol primitives,
+transport, authorization, validation, tests, and deployment.
 
-Your first job is discovery, not code. MCP servers are small when the transport,
-auth, and tool/resource shape are chosen correctly; they become painful when
-those choices are guessed.
+Choose the operating mode before acting:
 
-Before scaffolding, answer the Phase 1 questions. If the user's request already
-answers them, state the inferred choices and proceed.
+| Mode                 | Default behavior                                                                                                           |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| Build or change      | Design, implement, and verify the requested server changes.                                                                |
+| Audit or review      | Inspect and report with evidence. Do not edit files or mutate external systems unless the user explicitly asks.            |
+| Migration or upgrade | Audit the current implementation first. Implement the migration only when the request includes authorization to change it. |
+
+The first decision is the protocol era. The released `2026-07-28` protocol is
+stateless and materially different from revisions through `2025-11-25`. Do not
+mix their lifecycle or transport patterns. Read `references/protocol-eras.md`
+before choosing an SDK or scaffold.
+
+For an existing server, read `references/migrate-2026-07-28.md` and inventory
+its lifecycle, transport, state, server-to-client requests, caching,
+authorization, SDK entry points, and real client versions before editing it.
+
+This skill is TypeScript-first: its ready-to-copy scaffold targets the official
+TypeScript SDK v2. For Python or another SDK, verify every required modern wire
+behavior in the selected release instead of transliterating TypeScript APIs.
+
+Your first job is discovery, not code. MCP servers stay small when protocol
+version, transport, authorization, and primitive shape are chosen explicitly.
 
 ---
 
 ## Phase 1 — Interrogate the use case
 
-Ask the questions in one concise batch. Adapt wording to what the user already
-said.
+Answer these questions before scaffolding. If the request already answers them,
+state the inferred choices and proceed.
 
 ### 1. What does the server expose?
 
-| It exposes... | Likely direction |
-|---|---|
-| A cloud API, SaaS app, database, or service | Remote Streamable HTTP |
-| Local files, a local process, localhost service, or desktop state | Local stdio |
-| Pure computation with no user-local state | Remote Streamable HTTP by default |
-| A private internal service for one team | Remote Streamable HTTP or local stdio, based on network access |
+| It exposes...                                                | Likely direction                                               |
+| ------------------------------------------------------------ | -------------------------------------------------------------- |
+| A cloud API, SaaS app, database, or service                  | Remote Streamable HTTP                                         |
+| Local files, a local process, localhost service, or hardware | Local stdio                                                    |
+| Desktop app with an existing in-process service or local API | Embedded loopback HTTP, optionally with a stdio shim           |
+| Pure computation with no user-local state                    | Remote Streamable HTTP by default                              |
+| A private internal service                                   | Remote Streamable HTTP or local stdio, based on network access |
 
-### 2. Who connects to it?
+For an existing application, identify the in-process service or local API that
+already owns validation, authorization, persistence, and events. MCP handlers
+should adapt to that layer rather than duplicate its business logic.
+
+### 2. Who connects, and which protocol era do they support?
 
 - One developer or a local automation script: local stdio is acceptable.
 - A team, organization, or external users: remote Streamable HTTP.
 - A self-hosted customer deployment: remote Streamable HTTP inside their
   deployment boundary.
-- Name the target hosts if known, such as Codex, Claude Code, Cursor, ChatGPT,
-  a browser app, or a custom client. Real hosts differ in OAuth discovery,
-  registration, callback, token refresh, and tool-schema UX. For remote OAuth
-  servers, see `references/target-client-compatibility.md`.
+- Name the target hosts and versions, such as Codex, Claude Code, Cursor,
+  ChatGPT, a browser app, or a custom client.
+- For a new server, target the modern `2026-07-28` era. Add 2025-era support
+  only when a required host needs it, and test each era independently.
+- Treat product-level rollout announcements as leads, not compatibility proof.
+  Record the exact web, desktop, CLI, connector, or embedded host version tested.
+- For remote OAuth servers, read
+  `references/target-client-compatibility.md`.
 
 ### 3. What primitives does it need?
 
-- Tools: model-invoked actions. Use for searches, reads with model-chosen
-  parameters, writes, mutations, and calls into APIs.
-- Resources: read-only context the host can browse or attach, such as docs,
-  files, records, logs, schemas, or versioned content.
-- Prompts: reusable user-invoked workflows.
+- Tools: model-invoked actions, searches, parameterized reads, and mutations.
+- Resources: application-controlled, read-only context identified by URI.
+- Prompts: user-invoked message templates or workflows.
+- Elicitation: additional user input needed while resolving `tools/call`,
+  `resources/read`, or `prompts/get`. In the modern era this uses a multi
+  round-trip `input_required` result, not a direct server-to-client request.
 
-Most servers start with tools. Use resources when the server has browsable
-context that is valuable independent of a single tool call.
+Most servers start with tools. Use resources when context is useful independent
+of a single tool call. Use prompts only for a genuinely reusable user workflow.
+When selecting resources, templates, or prompts, read
+`references/resources-and-prompts.md` now. When selecting subscriptions or an
+extension, read `references/server-capabilities.md` now.
 
 ### 4. How many actions are there?
 
 - Under roughly 15 actions: one tool per action.
-- 15-30 actions: still workable, but audit near-duplicates.
-- Dozens to hundreds of actions: use a search + execute pattern.
+- 15–30 actions: still workable, but audit near-duplicates.
+- Dozens to hundreds of actions: consider a discovery-plus-execution pattern.
 
-### 5. Does a tool need mid-call user input?
+This is product guidance, not a protocol limit.
 
-- Simple non-sensitive input: use elicitation, with capability checks and a
-  fallback.
-- Sensitive input such as API keys, passwords, access tokens, or payment
-  credentials: do not use form elicitation. Use OAuth or URL-mode elicitation
-  with identity binding. See `references/elicitation.md`.
+### 5. Does a request need more user input?
 
-### 6. What auth is required?
+- Ordinary required input: put it in the tool/resource/prompt arguments.
+- Simple non-sensitive input needed mid-operation: use form elicitation through
+  the modern MRTR flow, with capability checks and a fallback.
+- Secrets, API keys, passwords, payment credentials, or third-party OAuth: use
+  URL-mode elicitation or a separate trusted setup flow. Never collect them in
+  form mode. See `references/elicitation.md`.
 
-Separate two auth planes:
+### 6. What authorization is required?
 
-- MCP client -> MCP server: who is allowed to call `/mcp`.
-- MCP server -> upstream service: what credentials the MCP server uses when it
-  calls the API/database/service it wraps.
+Separate two authorization planes:
 
-Do not collapse those into one vague "API key" answer. See `references/auth.md`.
+- MCP client -> MCP server: who may call the MCP endpoint.
+- MCP server -> upstream service: which credential the server uses for the API,
+  database, or service it wraps.
+
+Do not collapse them into one vague "API key". See `references/auth.md`.
+
+### 7. Does state span requests?
+
+Modern MCP has no protocol session. If application state spans calls, mint an
+opaque handle and pass it as an ordinary result/argument. Authorize the handle
+on every use and give it a documented lifetime. For an MRTR retry, use an
+integrity-protected `requestState` bound to the caller, operation, and expiry.
 
 ---
 
 ## Phase 2 — Recommend a server shape
 
-Recommend one path.
+Recommend one primary path and name any compatibility path separately.
 
-### Remote Streamable HTTP server
+### Remote Streamable HTTP
 
-Default for cloud APIs, team servers, self-host deployments, and anything meant
-to be reachable over the network.
+Default for cloud APIs, team servers, self-hosted deployments, and anything
+reachable over the network.
 
-Why it wins:
+For `2026-07-28`:
 
-- one deployed URL serves all clients
-- ordinary HTTP auth works
-- OAuth and browser redirects are possible
-- upgrades happen server-side
-- works with the protocol's remote transport
+- the MCP endpoint accepts POST; GET and DELETE are not part of the modern
+  transport
+- every request is self-contained and carries protocol version and client
+  capabilities in `_meta`
+- there is no `initialize` handshake, `Mcp-Session-Id`, session affinity, or SSE
+  replay
+- a response can be JSON or a request-scoped SSE stream
+- long-lived change events use `subscriptions/listen`
 
-Use `references/remote-http-scaffold.md` for a portable TypeScript or Python
-scaffold. Use `references/deploy-cloudflare-workers.md` only when the user
-explicitly wants a Cloudflare Workers deploy target.
+Use `references/remote-http-scaffold.md` for the modern TypeScript scaffold.
+Use `references/deploy-cloudflare-workers.md` only for a Cloudflare Workers
+target.
 
-### Local stdio server
+### Local stdio
 
-Use when the server must access user-local files, user-local processes, local
-hardware, or local desktop state.
+Use when the server must access user-local files, processes, hardware, or
+desktop state.
 
 Keep local stdio simple:
 
+- write only MCP JSON-RPC messages to stdout; log to stderr
 - validate and confine filesystem paths
 - avoid broad shell execution
 - avoid plaintext secrets on disk
+- treat the process as a multiplexed transport, not a conversation or session
 - document exactly what local access the server needs
 
-This skill can design the server and the stdio command, but it does not cover
-runtime packaging.
+### Embedded desktop listener
+
+Use a loopback Streamable HTTP listener inside the desktop process when the app
+already has an in-process service layer and HTTP is a better host boundary than
+a child process. Keep one MCP registry/factory, adapt it to that existing
+service, and add a stdio shim only for hosts that require stdio. Treat loopback
+as a security boundary: bind locally, validate Host and Origin, authenticate the
+host, and own listener startup/shutdown with the desktop lifecycle. See
+`references/embedded-desktop.md`.
+
+### Legacy compatibility
+
+Revisions through `2025-11-25` use `initialize` and older Streamable HTTP
+semantics. If a target host requires that era, use an SDK-supported dual-era
+entry point or an explicitly separate legacy route. Never bolt legacy GET,
+DELETE, session IDs, or direct server-to-client requests onto the modern path.
+
+The official TypeScript v2 `createMcpHandler` and `serveStdio` entries support
+both eras. For a new modern-only server, explicitly set `legacy: "reject"`;
+enable the SDK's compatibility path only when a required client needs it.
+Existing sessionful legacy HTTP deployments still need a deliberately isolated
+legacy handler rather than session state inside the modern per-request factory.
 
 ---
 
 ## Phase 3 — Pick a tool design pattern
 
-Tool schemas and descriptions are part of the runtime contract. They are visible
-to models and hosts, so they should be precise, small, and stable.
+Tool schemas and descriptions are runtime contracts visible to models and hosts.
+Keep them precise, small, and stable.
 
-### Pattern A: One tool per action
+### Pattern A: one tool per action
 
 Use for small surfaces.
 
 ```text
 create_issue    — Create a new issue. Params: title, body, labels[]
-update_issue    — Update an existing issue. Params: id, title?, body?, state?
-search_issues   — Search issues by query string. Params: query, limit?
-add_comment     — Add a comment to an issue. Params: issue_id, body
+update_issue    — Update an issue. Params: id, title?, body?, state?
+search_issues   — Search issues. Params: query, limit?
+add_comment     — Add a comment. Params: issue_id, body
 ```
 
-Why it works: each tool has a tight name, description, input schema, output
-shape, and safety annotation.
+### Pattern B: discover + execute
 
-### Pattern B: Search + execute
-
-Use for large API surfaces where listing every operation would flood the model
-context.
+Use selectively for very large API surfaces.
 
 ```text
-search_actions  — Given a natural-language intent, return matching actions
-                  with IDs, descriptions, and parameter schemas.
-execute_action  — Run an action by ID with a params object.
+search_actions  — Return matching actions with IDs, descriptions, safety, and schemas.
+execute_action  — Execute one action by ID with validated parameters.
 ```
 
-The server owns the full action catalog internally. The model searches, selects,
-then executes. Optionally promote the 3-5 most common actions to dedicated
-tools.
+The server owns the full catalog. Never hide whether the selected action is a
+read, write, or destructive operation behind a generic annotation. Consider
+promoting the most common actions to dedicated tools.
 
-See `references/tool-design.md` for schema and return-shape guidance.
+See `references/tool-design.md`.
 
 ---
 
 ## Phase 4 — Pick an implementation stack
 
-Prefer the user's existing stack. If there is no preference:
+Prefer the user's existing stack only if it supports the target protocol era.
+Framework familiarity does not compensate for an incompatible wire protocol.
 
-| Stack | Use when |
-|---|---|
-| Official TypeScript SDK | Default for TypeScript/JavaScript servers and Hono/Express/Workers environments. |
-| FastMCP 3.x for Python | User prefers Python or is wrapping Python libraries. |
+| Stack                                                  | Use when                                                                                                                                                                                     |
+| ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Official TypeScript SDK v2 split packages              | Default for a new `2026-07-28` TypeScript/JavaScript server. Use the modern `createMcpHandler` or `serveStdio` entry points.                                                                 |
+| Official TypeScript SDK v1 `@modelcontextprotocol/sdk` | Maintaining a 2025-era server. Do not describe it as a current-protocol scaffold.                                                                                                            |
+| Python/FastMCP or another SDK                          | The user prefers that ecosystem and its installed version is verified to support every required `2026-07-28` behavior. Otherwise target the older era explicitly or choose a supporting SDK. |
 
-Version rule for TypeScript:
-
-- Stable production scaffolds should use the current stable SDK line unless the
-  target repo has already chosen the SDK v2 split packages.
-- The SDK v2 `main` branch uses split packages such as
-  `@modelcontextprotocol/server`, `@modelcontextprotocol/node`,
-  `@modelcontextprotocol/express`, and `@modelcontextprotocol/hono`.
-- Before implementation, confirm the package version and import paths. Do not
-  mix v1 and v2 examples in one codebase.
-
-See `references/versions.md`.
+The official TypeScript v2 split packages are stable, but still confirm package
+tags, imports, and supported protocol versions before implementation. Do not
+mix v1 and v2 imports. See `references/versions.md`.
 
 ---
 
 ## Phase 5 — Scaffold and verify
 
-Once deployment model, primitive shape, framework, and auth are chosen:
+Once protocol era, deployment, primitives, framework, and authorization are
+chosen:
 
 1. Scaffold a minimal server with one read-only tool.
-2. Add auth before adding private or mutating operations.
-3. Add resources/prompts only if they solve a concrete context problem.
-4. Add tests or smoke checks for:
-   - initialize
-   - tools/list
-   - tools/call
-   - resources/list or resources/read, if resources exist
-   - unauthorized request
-   - invalid input
-   - a tool error returned as an MCP tool result, not a crashed transport
-5. Run MCP Inspector against the local server.
-6. Test with the actual target MCP host.
-7. For OAuth remote servers, verify login, reconnect/refresh after access-token
-   expiry, and revoke/re-auth behavior with each target host.
+2. Add authorization before private data or mutations.
+3. Add resources/prompts only when they solve a concrete context problem.
+4. Add modern-protocol checks for:
+   - `server/discover`
+   - required per-request `_meta`
+   - `tools/list` and `tools/call`
+   - required wire `resultType`
+   - required `ttlMs` and `cacheScope` on cacheable results
+   - `resources/list`, `resources/read`, `resources/templates/list`, or
+     `prompts/list`/`prompts/get` when exposed
+   - malformed request and unsupported protocol version
+   - a domain/input failure returned as a tool result, not a crashed transport
+5. For Streamable HTTP, test POST request headers (`MCP-Protocol-Version`,
+   `Mcp-Method`, and `Mcp-Name` where required) on JSON-RPC requests,
+   header/body mismatch, Origin, unauthorized access, and every enabled server
+   response mode. A JSON-only server is valid; clients must support JSON and
+   request-scoped SSE. The current revision does not define notification-POST
+   header requirements.
+6. Run the current conformance suite and MCP Inspector version that support the
+   target era.
+7. Test with each actual target host.
+8. If MCP OAuth is selected, verify login, scope step-up, reconnect/refresh
+   after token expiry, revoke/re-auth, and registration behavior with each
+   target host.
+9. If supporting both eras, run the same functional tests against modern and
+   legacy connections and assert that their transport behaviors stay separate.
+10. For mutating tools, simulate a response stream failing after the operation
+    commits. Verify that a retry with a new JSON-RPC ID cannot silently duplicate
+    harmful work.
+11. Make an explicit `subscriptions/listen` decision: either reject it before
+    opening SSE and test that behavior, or provide a real event bus, fan-out,
+    capacity, cancellation, and reconnect tests. Capability advertising alone
+    does not disable the SDK listen router.
 
 ---
 
 ## Server primitives reference
 
-| Primitive | Who triggers it | Use when |
-|---|---|---|
-| Tools | Model through the host | Actions, searches, reads with parameters, writes |
-| Resources | Host application | Browsable/read-only context |
-| Prompts | User | Reusable workflows or message templates |
-| Elicitation | Server mid-request | Simple user input or URL handoff, with client capability support |
-| Sampling | Server mid-request | Server asks the host model to generate/classify/summarize |
+| Primitive     | Controller                            | Use when                                                           |
+| ------------- | ------------------------------------- | ------------------------------------------------------------------ |
+| Tools         | Model through the host                | Actions, searches, parameterized reads, writes                     |
+| Resources     | Host application                      | Browsable/read-only URI-addressed context                          |
+| Prompts       | User                                  | Reusable workflows or message templates                            |
+| Elicitation   | Server during a supported request     | Additional non-secret form input or a trusted URL handoff via MRTR |
+| Subscriptions | Client                                | Opt in to list/resource change notifications                       |
+| Extensions    | Negotiated client/server capabilities | Optional features such as MCP Apps or Tasks                        |
 
-Read:
-
-- `references/tool-design.md`
-- `references/resources-and-prompts.md`
-- `references/elicitation.md`
-- `references/server-capabilities.md`
+Roots, Sampling, Logging, Dynamic Client Registration, and HTTP+SSE are
+deprecated in `2026-07-28`. They remain available only for compatibility during
+their deprecation windows; new servers should use their documented migration
+paths. See `references/server-capabilities.md`.
 
 ---
 
 ## Deployment checklist
 
-Before calling a server ready:
+Before calling a modern server ready:
 
-- [ ] `/mcp` uses the correct transport for the target: Streamable HTTP or stdio.
-- [ ] Streamable HTTP endpoint handles the methods required by the chosen mode
-      (`POST`, and `GET`/`DELETE` where stateful sessions or resumability are in
-      play).
-- [ ] `Origin` is validated for HTTP requests when present.
-- [ ] Local HTTP servers bind to localhost or validate Host headers.
-- [ ] Unsupported `MCP-Protocol-Version` values are rejected by the SDK,
-      middleware, or explicit route code.
-- [ ] Auth is implemented before private data or mutations are exposed.
-- [ ] MCP client auth is separate from upstream-service auth.
-- [ ] OAuth testing is run without bearer-token config that masks OAuth
-      discovery in the target host.
-- [ ] Tool schemas reject invalid input at the MCP seam.
-- [ ] Mutating tools are separated from read tools.
-- [ ] Tools include useful `title`, `description`, `inputSchema`, and safety
-      annotations.
-- [ ] Errors return MCP results/errors, not HTML 500s.
-- [ ] Secrets come from config/env/secret stores, never hardcoded.
-- [ ] Inspector and target-host smoke checks pass, including post-expiry
-      reconnect/refresh for OAuth servers.
+- [ ] `server/discover` advertises supported versions, capabilities, identity,
+      instructions when useful, and cache hints.
+- [ ] Every request is processed independently; no caller identity, capability,
+      conversation, or application state is inferred from a connection.
+- [ ] Streamable HTTP exposes POST at the MCP endpoint; GET/DELETE return 405
+      unless they belong to a deliberately separate legacy route.
+- [ ] Streamable HTTP validates `Origin` when present and local servers bind to
+      localhost or validate Host.
+- [ ] Required JSON-RPC request POST headers are present, safely decoded, and
+      match the request body; unsupported versions return the specified error.
+- [ ] Every enabled server response mode is tested. A JSON-only server is
+      allowed; clients are verified to accept both JSON and request-scoped SSE.
+- [ ] `subscriptions/listen` is either explicitly rejected without opening SSE,
+      or backed by a tested event bus with fan-out, capacity, cancellation, and
+      reconnect behavior.
+- [ ] There are no protocol sessions, resumability, `Last-Event-ID`, or
+      server-initiated JSON-RPC requests on the modern path.
+- [ ] Auth precedes private data and mutations; MCP auth is separate from
+      upstream-service auth.
+- [ ] If MCP OAuth is selected, Protected Resource Metadata,
+      authorization-server discovery, `resource` audience binding, PKCE,
+      issuer validation, and client registration behavior are tested.
+- [ ] Tool/resource/prompt schemas reject invalid input and external `$ref`
+      fetching is disabled by default.
+- [ ] Tools include useful names, titles, descriptions, schemas, and accurate
+      annotations; annotations are never treated as authorization.
+- [ ] Tool lists are deterministic and cacheable results use correct `ttlMs`
+      and `cacheScope` values.
+- [ ] Expected domain/input failures return useful tool results; malformed MCP
+      requests return protocol errors; HTTP failures never become HTML pages.
+- [ ] Stateful workflows use explicit, authorized handles. MRTR state is
+      integrity-protected and replay-bounded.
+- [ ] Secrets never appear in source, results, resources, prompts, URLs, logs,
+      traces, exceptions, or test snapshots.
+- [ ] Conformance, Inspector, and real-host checks pass for every supported era.
 
 ---
 
-## Reference files
+## Reference routing
 
-- `references/remote-http-scaffold.md` — portable Streamable HTTP scaffold
-- `references/deploy-cloudflare-workers.md` — Cloudflare Workers server target
-- `references/tool-design.md` — tool naming, schemas, annotations, returns
-- `references/auth.md` — MCP server auth and upstream auth
-- `references/resources-and-prompts.md` — read-only context and prompt templates
-- `references/elicitation.md` — mid-call user input and URL handoff
-- `references/server-capabilities.md` — instructions, sampling, roots, logging,
-  progress, cancellation
-- `references/target-client-compatibility.md` — real-host OAuth, refresh, and
-  tool-UX checks
-- `references/versions.md` — version-sensitive claims ledger
+Use `references/protocol-eras.md` as the canonical wire-invariants reference;
+context-specific references should point back to it rather than inventing a
+second protocol model.
+
+| Situation                                      | Read                                        |
+| ---------------------------------------------- | ------------------------------------------- |
+| Any era or wire-protocol decision              | `references/protocol-eras.md`               |
+| Audit, migration, or dual-era rollout          | `references/migrate-2026-07-28.md`          |
+| TypeScript remote HTTP implementation          | `references/remote-http-scaffold.md`        |
+| Pinned runnable TypeScript HTTP example        | `assets/typescript-http/`                   |
+| Embedded Electron or other desktop application | `references/embedded-desktop.md`            |
+| Cloudflare Workers deployment                  | `references/deploy-cloudflare-workers.md`   |
+| Tool names, schemas, annotations, or state     | `references/tool-design.md`                 |
+| MCP OAuth or upstream authorization            | `references/auth.md`                        |
+| Resources, URI templates, or prompts           | `references/resources-and-prompts.md`       |
+| Form/URL elicitation or MRTR state             | `references/elicitation.md`                 |
+| Discovery, caching, subscriptions, extensions  | `references/server-capabilities.md`         |
+| Real-host negotiation, OAuth, or tool UX       | `references/target-client-compatibility.md` |
+| Package/API/version-sensitive claim            | `references/versions.md`                    |
